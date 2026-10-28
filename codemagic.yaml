@@ -1,0 +1,34 @@
+# Codemagic 构建配置（无需 Mac，也无需 GitHub Actions 的 macOS runner）
+# 用法：Codemagic → Add application → 选这个 GitHub 仓库 → 它会自动读取本文件 → Start new build
+workflows:
+  ios-unsigned:
+    name: GoutouJunshi unsigned IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      xcode: latest
+      vars:
+        SCHEME: GoutouJunshi
+        PROJECT: integrations/jev_ios/GoutouJunshi.xcodeproj
+    scripts:
+      - name: Build unsigned device app
+        script: |
+          set -e
+          xcodebuild -project "$PROJECT" -scheme "$SCHEME" \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+      - name: Package ipa
+        script: |
+          set -e
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          echo "app: $APP"
+          ls "$APP/PlugIns" || true
+          rm -rf Payload GoutouJunshi-unsigned.ipa
+          mkdir -p Payload && cp -R "$APP" Payload/
+          ditto -c -k --sequesterRsrc --keepParent Payload GoutouJunshi-unsigned.ipa
+          shasum -a 256 GoutouJunshi-unsigned.ipa
+    artifacts:
+      - GoutouJunshi-unsigned.ipa
