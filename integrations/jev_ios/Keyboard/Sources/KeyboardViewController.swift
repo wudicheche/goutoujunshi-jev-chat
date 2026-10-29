@@ -22,6 +22,8 @@ final class KeyboardViewController: UIInputViewController {
     private let header = UIStackView()
     private let footer = UILabel()
     private var height: NSLayoutConstraint?
+    /// 盖在系统容器“我们视图上方”那一条灰带上的米色遮罩（见 updateTopCover）
+    private weak var topCover: UIView?
     private var typingConstraints = [NSLayoutConstraint]()
     private var confirmButton: UIButton?
     private var analyzeButton: UIButton?
@@ -121,6 +123,7 @@ final class KeyboardViewController: UIInputViewController {
                 showTyping = false
                 notice = "已恢复本轮内容（暂存 5 分钟）；请重新核对原文、双方身份与当前收件人。"
             } else { mode = .idle; notice = "" }
+            autoImportConfigFromClipboard()
             receiveCapture()
         } catch { mode = .gate; notice = error.localizedDescription }
         render()
@@ -135,6 +138,15 @@ final class KeyboardViewController: UIInputViewController {
     private func receiveCapture() {
         guard isKeyboardVisible, hasFullAccess, mode != .loading, mode != .insertConfirmation,
               let store = store else { return }
+        // 剪贴板通道：免费签名下 App 与键盘不共享容器，快捷指令把识别结果写进剪贴板，这里取走。
+        // 待机页也接——用户不一定先点“识图”；只需要「最近 5 分钟内」的结果。
+        if !showTyping, mode == .idle || mode == .screenshot,
+           let envelope = GoutouClipboard.readCapture(),
+           receivedCaptureID != envelope.result.request.id,
+           envelope.createdAt.timeIntervalSinceNow > -300 {
+            applyClipboardCapture(envelope)
+            return
+        }
         guard let result = store.captureMailbox.peek(relationship: store.relationship(), config: store.config()) else {
             if receivedCaptureID != nil, mode == .screenshot, pendingScreenshot != nil {
                 receivedCaptureID = nil; pendingScreenshot = nil
@@ -172,14 +184,69 @@ final class KeyboardViewController: UIInputViewController {
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         updateHeight()
+        updateTopCover()
     }
     private func updateHeight() {
         let screen = view.window?.windowScene?.coordinateSpace.bounds ?? CGRect(x: 0, y: 0, width: 390, height: 844)
         let compact = screen.width > screen.height
         typingView.setCompactLayout(compact)
-        let desired = showTyping ? (compact ? 244.0 : 326.0) + view.safeAreaInsets.bottom
+        let base = showTyping ? (compact ? 244.0 : 326.0) + view.safeAreaInsets.bottom
             : min(450, max(220, screen.height * 0.46))
+        var desired = base
+        // 切换输入法回来后，系统容器通常只比我们高十几～几十 pt，多出来的那截会露出系统灰底。
+        // 这里直接跟“基准高度”比：差值 ≤ 80pt 就撑满容器盖住它；差得多（比如刚从 450pt 的
+        // 军师页切回来）就保持基准高度，避免键盘下方拉出一大片米色空白。
+        if let container = view.superview, container.bounds.height > base,
+           container.bounds.height - base <= 80, container.bounds.height <= screen.height * 0.6 {
+            desired = container.bounds.height
+        }
         if height?.constant != desired { height?.constant = desired }
+    }
+
+    /// 第二次弹出 / 从别的输入法切回时，系统容器会在我们视图上方留一条灰带
+    /// （我们自己的 frame 没盖到）。这里在系统容器里放一块米色遮罩，只覆盖
+    /// “容器顶部 → 我们视图顶部”这一条，不碰系统底部那条地球/麦克风栏。
+    private func updateTopCover() {
+        // 灰带不一定在我们直接父视图里，往祖先链上找第一个“顶部比我们高 1–80pt”的容器，
+        // 在那里面铺一条米色。找不到就什么都不做（宁可留着系统那条，也不能涂到宿主 App）。
+        var host: UIView? = view.superview
+        var depth = 0
+        var target: UIView?
+        var offset: CGFloat = 0
+        while let candidate = host, depth < 4 {
+            let y = view.convert(CGPoint.zero, to: candidate).y
+            if y > 0.5, y <= 80 { target = candidate; offset = y; break }
+            host = candidate.superview
+            depth += 1
+        }
+        guard let container = target else {
+            topCover?.isHidden = true
+            return
+        }
+        let cover: UIView
+        if let existing = topCover, existing.superview === container {
+            cover = existing
+        } else {
+            topCover?.removeFromSuperview()
+            let created = UIView()
+            created.backgroundColor = KB.cream
+            created.isUserInteractionEnabled = false
+            created.accessibilityElementsHidden = true
+            container.addSubview(created)
+            created.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                created.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                created.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+                created.topAnchor.constraint(equalTo: container.topAnchor),
+                created.heightAnchor.constraint(equalToConstant: max(1, offset))
+            ])
+            topCover = created
+            cover = created
+        }
+        cover.isHidden = false
+        if let heightConstraint = cover.constraints.first(where: { item in item.firstAttribute == .height }) {
+            heightConstraint.constant = max(1, offset)
+        }
     }
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
@@ -323,6 +390,12 @@ final class KeyboardViewController: UIInputViewController {
                 KB.button("读取剪贴板", icon: "doc.on.clipboard") { [weak self] in self?.read(.clipboard) }
             ]))
             content.addArrangedSubview(KB.button("读取输入框里的草稿", icon: "text.cursor") { [weak self] in self?.read(.input) })
+            if needsClipboardConfig {
+                content.addArrangedSubview(KB.button("从剪贴板导入配置与密钥", icon: "square.and.arrow.down") { [weak self] in
+                    self?.importConfigFromClipboard()
+                })
+                content.addArrangedSubview(KB.label("免费签名读不到主 App 的配置：先在 App 设置页点「复制配置与密钥给键盘」，再点这里导入。", size: 12))
+            }
             content.addArrangedSubview(KB.label("相册选图：打开狗头军师 App → 从截图读取聊天。核对分析后交给键盘。输入框读取只取得自己的草稿。", size: 13))
         case .screenshot: screenshotView()
         case .review: reviewView()
@@ -366,6 +439,94 @@ final class KeyboardViewController: UIInputViewController {
         }
         render()
     }
+
+    /// 免费签名（个人 Apple ID）下 App Group 不通，键盘拿不到主 App 的配置与密钥。
+    /// 主 App 设置页把整份配置放进剪贴板，这里解码后落到键盘自己的容器里。
+    private var needsClipboardConfig: Bool {
+        guard let secrets = try? CredentialVault.load() else { return true }
+        return secrets.deepseek.isEmpty && secrets.openrouter.isEmpty && secrets.jev.isEmpty
+    }
+
+    private var awaitingClipboardCapture: Bool { waitingCapture != nil && receivedCaptureID == nil }
+
+    /// 键盘默认停在「打字」页，用户常常看不到军师页里的「导入」按钮，
+    /// 所以每次唤起时顺手看一眼剪贴板：有配置包就自动同步（只在缺密钥或识图方式不一致时才动）。
+    private func autoImportConfigFromClipboard() {
+        guard let store = store,
+              let payload: GoutouHandoffPayload = GoutouClipboard.readConfig() else { return }
+        let secrets = (try? CredentialVault.load()) ?? ProviderSecrets()
+        let noKeys = secrets.deepseek.isEmpty && secrets.openrouter.isEmpty && secrets.jev.isEmpty
+        let incomingProfiles = payload.profiles ?? []
+        guard noKeys || store.config().ocr != payload.config.ocr
+                || store.archived().count != incomingProfiles.count
+                || store.relationship().id != payload.relationship.id else { return }
+        _ = try? store.saveConfig(payload.config)
+        // 先归档对象、最后再设当前对象：saveRelationship(archive: true) 会把“当前对象”也改掉，
+        // 顺序反了就会变成最后一个档案对象，用户看到的就是“对象没同步/变成了别的对象”。
+        for profile in incomingProfiles { _ = try? store.saveRelationship(profile, archive: true) }
+        _ = try? store.saveRelationship(payload.relationship, archive: false)
+        for (name, value) in payload.secrets where !value.isEmpty {
+            try? CredentialVault.write(value, name: name)
+        }
+        config = store.config(); relationship = store.relationship()
+        notice = "已从剪贴板同步配置（识图：\(config.ocr.rawValue)，对象 \(store.archived().count) 个）"
+    }
+
+    private func importConfigFromClipboard() {
+        guard let store = store else { return }
+        guard let payload: GoutouHandoffPayload = GoutouClipboard.readConfig() else {
+            notice = "剪贴板里没有配置：先在 App 设置页点「复制配置与密钥给键盘」。"
+            render(); return
+        }
+        do {
+            try store.saveConfig(payload.config)
+            for profile in payload.profiles ?? [] { _ = try? store.saveRelationship(profile, archive: true) }
+            try store.saveRelationship(payload.relationship, archive: false)
+            for (name, value) in payload.secrets where !value.isEmpty {
+                try? CredentialVault.write(value, name: name)
+            }
+            config = store.config(); relationship = store.relationship()
+            notice = "已导入配置与密钥（识图：\(config.ocr.rawValue)，对象 \(store.archived().count) 个）；现在可以识图或分析了。"
+        } catch {
+            notice = error.localizedDescription
+        }
+        render()
+    }
+
+    private func applyClipboardCapture(_ envelope: GoutouCaptureEnvelope) {
+        // 快捷指令把主 App 的配置与密钥一起捎过来了：先落到键盘自己的容器，再按新配置渲染。
+        if let store = store {
+            _ = try? store.saveConfig(envelope.config)
+            for profile in envelope.profiles ?? [] { _ = try? store.saveRelationship(profile, archive: true) }
+            _ = try? store.saveRelationship(envelope.relationship, archive: false)
+            for (name, value) in envelope.secrets where !value.isEmpty {
+                try? CredentialVault.write(value, name: name)
+            }
+            config = store.config(); relationship = store.relationship()
+        }
+        let result = envelope.result
+        showTyping = false
+        waitingCapture = nil
+        invalidate(clearTranscript: true)
+        receivedCaptureID = result.request.id
+        if let error = result.error {
+            mode = .screenshot; notice = error
+        } else if let image = result.screenshot {
+            pendingScreenshot = image; mode = .screenshot
+            notice = "已收到截图（剪贴板）· \(config.ocr.rawValue)；点“发送截图并识别”后开始。"
+        } else {
+            transcript = result.transcript; mode = .review; confirmed = false
+            notice = "截图文字已到键盘（剪贴板）· \(result.request.config.ocr.rawValue)；请核对原文、双方身份及当前收件人。"
+        }
+        render()
+    }
+
+    private func clipboardProbe() -> String {
+        guard let envelope = GoutouClipboard.readCapture() else { return "无结果" }
+        let age = max(0, Int(-envelope.createdAt.timeIntervalSinceNow))
+        return "有结果（\(age) 秒前）"
+    }
+
     private func toolbarButton(_ icon: String, label: String, action: (() -> Void)? = nil) -> UIButton {
         let button = UIButton(type: .system)
         var style = UIButton.Configuration.plain()
@@ -379,6 +540,12 @@ final class KeyboardViewController: UIInputViewController {
     }
     private func screenshotView() {
         content.addArrangedSubview(KB.label("从截图读取聊天", size: 17, bold: true))
+        content.addArrangedSubview(KB.label("自检：识图=\(config.ocr.rawValue) · 密钥=\(needsClipboardConfig ? "缺" : "已导入") · 剪贴板=\(clipboardProbe())", size: 12))
+        if needsClipboardConfig {
+            content.addArrangedSubview(KB.button("从剪贴板导入配置与密钥", icon: "square.and.arrow.down") { [weak self] in
+                self?.importConfigFromClipboard()
+            })
+        }
         content.addArrangedSubview(KB.card([
             KB.label("系统截屏 → 按配置识图", size: 16, bold: true),
             KB.label("双击已绑定的系统悬浮球，运行“截屏 → 截图交给键盘（按配置）”。已有快捷指令会沿用新配置，无需重建。", size: 14),
